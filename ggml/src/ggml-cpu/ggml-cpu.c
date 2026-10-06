@@ -3098,6 +3098,281 @@ static int ggml_cpu_try_fuse_ops(
     return 0;
 }
 
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#include <unistd.h>
+#include <time.h>
+#include <sched.h>
+// expert I/O experiments for streamed MoE weights: GGML_EXPERT_STATS=1 logs mincore residency of routed expert slices, GGML_EXPERT_PREFAULT=1 makes all threads touch the routed slices of the layer (gate/up/down) before compute
+static int      es_stats_on, es_pref_on;
+static size_t   es_page;
+static uint64_t es_calls, es_slices, es_slices_full, es_pages, es_pages_res, es_ns_pref, es_ns_mmid;
+static pthread_once_t es_once = PTHREAD_ONCE_INIT;
+
+// GGML_EXPERT_PREAD=N: N I/O threads pread the missing pages of the routed slices (fills the page cache the mmap shares); GGML_EXPERT_WILLNEED=1: madvise the missing runs instead
+static uint64_t es_now(void);
+static int32_t es_id(const struct ggml_tensor * ids, int64_t r, int64_t c);
+typedef struct { int fd; size_t off; size_t len; } es_job;
+static int             es_pread_n, es_willneed_on, es_span_on;
+static es_job *        es_jobs;
+static size_t          es_jobs_n, es_jobs_cap;
+static atomic_size_t   es_next, es_done;
+static atomic_uint_fast64_t es_gen;
+static uint64_t        es_bytes_io, es_ns_io;
+
+static void es_do_jobs(char * buf, size_t buf_n) {
+    for (;;) {
+        const size_t i = atomic_fetch_add(&es_next, 1);
+        if (i >= es_jobs_n) {
+            return;
+        }
+        const es_job j = es_jobs[i];
+        for (size_t o = 0; o < j.len;) {
+            const size_t n = j.len - o < buf_n ? j.len - o : buf_n;
+            const ssize_t r = pread(j.fd, buf, n, (off_t) (j.off + o));
+            if (r <= 0) {
+                break;
+            }
+            o += (size_t) r;
+        }
+        atomic_fetch_add(&es_done, 1);
+    }
+}
+
+static void * es_io_worker(void * arg) {
+    (void) arg;
+    const size_t buf_n = 4u << 20;
+    char * buf = malloc(buf_n);
+    uint64_t seen = 0;
+    for (;;) {
+        while (atomic_load(&es_gen) == seen) {
+            usleep(20);
+        }
+        seen = atomic_load(&es_gen);
+        es_do_jobs(buf, buf_n);
+    }
+    return NULL;
+}
+
+static void es_init(void) {
+    es_stats_on    = getenv("GGML_EXPERT_STATS") != NULL;
+    es_pref_on     = getenv("GGML_EXPERT_PREFAULT") != NULL;
+    es_willneed_on = getenv("GGML_EXPERT_WILLNEED") != NULL;
+    es_span_on     = getenv("GGML_EXPERT_PREAD_SPAN") != NULL;
+    es_pread_n     = getenv("GGML_EXPERT_PREAD") ? atoi(getenv("GGML_EXPERT_PREAD")) : 0;
+    es_page        = (size_t) sysconf(_SC_PAGESIZE);
+    for (int i = 0; i < es_pread_n; i++) {
+        pthread_t t;
+        if (pthread_create(&t, NULL, es_io_worker, NULL) == 0) {
+            pthread_detach(t);
+        }
+    }
+}
+
+static void es_push(const char * a, size_t len) {
+    if (es_willneed_on) {
+        madvise((void *) a, len, MADV_WILLNEED);
+        es_bytes_io += len;
+        return;
+    }
+    size_t off;
+    const int fd = ggml_mmap_lookup(a, &off);
+    if (fd < 0) {
+        return;
+    }
+    const size_t chunk = es_span_on ? 4u << 20 : 1u << 20;
+    for (size_t o = 0; o < len; o += chunk) {
+        if (es_jobs_n == es_jobs_cap) {
+            es_jobs_cap = es_jobs_cap ? 2*es_jobs_cap : 1024;
+            es_jobs     = realloc(es_jobs, es_jobs_cap*sizeof(es_job));
+        }
+        es_jobs[es_jobs_n++] = (es_job) { fd, off + o, len - o < chunk ? len - o : chunk };
+    }
+    es_bytes_io += len;
+}
+
+// thread 0 only: find non-resident page runs of the routed slices of every MUL_MAT_ID sharing these ids, then read them
+static void es_io(const struct ggml_cgraph * g, int node_n) {
+    static unsigned char * vec;
+    static size_t vec_n;
+    const uint64_t t0 = es_now();
+    const struct ggml_tensor * ids = g->nodes[node_n]->src[2];
+    es_jobs_n = 0;
+    for (int j = node_n; j < g->n_nodes && j < node_n + 64; j++) {
+        const struct ggml_tensor * t = g->nodes[j];
+        if (t->op != GGML_OP_MUL_MAT_ID || t->src[2] != ids || !t->src[0]->data) {
+            continue;
+        }
+        const struct ggml_tensor * w = t->src[0];
+        for (int64_t r = 0; r < ids->ne[1]; r++) {
+            for (int64_t c = 0; c < ids->ne[0]; c++) {
+                const int32_t e = es_id(ids, r, c);
+                if (e < 0 || e >= w->ne[2]) {
+                    continue;
+                }
+                const uintptr_t a  = (uintptr_t) w->data + (size_t) e*w->nb[2];
+                const uintptr_t a0 = a & ~(uintptr_t) (es_page - 1);
+                const size_t len   = a + w->nb[2] - a0;
+                const size_t np    = (len + es_page - 1)/es_page;
+                if (np > vec_n) {
+                    vec   = realloc(vec, np);
+                    vec_n = np;
+                }
+                if (mincore((void *) a0, len, (char *) vec) != 0) {
+                    continue;
+                }
+                if (es_span_on) {
+                    size_t f = 0, l = np;
+                    while (f < np && (vec[f] & 1)) {
+                        f++;
+                    }
+                    while (l > f && (vec[l - 1] & 1)) {
+                        l--;
+                    }
+                    if (f < l) {
+                        es_push((const char *) a0 + f*es_page, (l - f)*es_page);
+                    }
+                    continue;
+                }
+                for (size_t i = 0; i < np;) {
+                    if (vec[i] & 1) {
+                        i++;
+                        continue;
+                    }
+                    size_t k = i;
+                    while (k < np && !(vec[k] & 1)) {
+                        k++;
+                    }
+                    es_push((const char *) a0 + i*es_page, (k - i)*es_page);
+                    i = k;
+                }
+            }
+        }
+    }
+    if (es_jobs_n > 0) {
+        static char * buf;
+        if (!buf) {
+            buf = malloc(4u << 20);
+        }
+        atomic_store(&es_next, 0);
+        atomic_store(&es_done, 0);
+        atomic_fetch_add(&es_gen, 1);
+        es_do_jobs(buf, 4u << 20);
+        while (atomic_load(&es_done) < es_jobs_n) {
+            sched_yield();
+        }
+    }
+    es_ns_io += es_now() - t0;
+}
+
+static uint64_t es_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec*1000000000ull + (uint64_t) ts.tv_nsec;
+}
+
+static bool es_decode_mmid(const struct ggml_tensor * node) {
+    if (node->op != GGML_OP_MUL_MAT_ID) {
+        return false;
+    }
+    const struct ggml_tensor * ids = node->src[2];
+    return node->src[0]->data && ids && ids->data && ids->type == GGML_TYPE_I32 && ids->ne[1] <= 4;
+}
+
+static bool es_first_for_ids(const struct ggml_cgraph * g, int node_n) {
+    const struct ggml_tensor * ids = g->nodes[node_n]->src[2];
+    for (int j = node_n - 1; j >= 0 && j >= node_n - 64; j--) {
+        if (g->nodes[j]->op == GGML_OP_MUL_MAT_ID && g->nodes[j]->src[2] == ids) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int32_t es_id(const struct ggml_tensor * ids, int64_t r, int64_t c) {
+    return *(const int32_t *) ((const char *) ids->data + r*ids->nb[1] + c*ids->nb[0]);
+}
+
+static void es_stats(const struct ggml_tensor * node) {
+    static unsigned char * vec;
+    static size_t vec_n;
+    const struct ggml_tensor * w   = node->src[0];
+    const struct ggml_tensor * ids = node->src[2];
+    es_calls++;
+    for (int64_t r = 0; r < ids->ne[1]; r++) {
+        for (int64_t c = 0; c < ids->ne[0]; c++) {
+            const int32_t e = es_id(ids, r, c);
+            if (e < 0 || e >= w->ne[2]) {
+                continue;
+            }
+            uintptr_t a  = (uintptr_t) w->data + (size_t) e*w->nb[2];
+            uintptr_t a0 = a & ~(uintptr_t) (es_page - 1);
+            size_t len   = a + w->nb[2] - a0;
+            size_t np    = (len + es_page - 1)/es_page;
+            if (np > vec_n) {
+                vec   = realloc(vec, np);
+                vec_n = np;
+            }
+            if (mincore((void *) a0, len, (char *) vec) != 0) {
+                continue;
+            }
+            size_t res = 0;
+            for (size_t i = 0; i < np; i++) {
+                res += vec[i] & 1;
+            }
+            es_slices++;
+            es_slices_full += res == np;
+            es_pages       += np;
+            es_pages_res   += res;
+        }
+    }
+    if (es_calls % 2000 == 0) {
+        fprintf(stderr, "expert_stats: calls=%llu slices=%llu slice_hit=%.3f page_res=%.3f miss_GiB=%.2f pref_ms=%.0f mmid_ms=%.0f io_GiB=%.2f io_ms=%.0f\n",
+            (unsigned long long) es_calls, (unsigned long long) es_slices, (double) es_slices_full/es_slices,
+            (double) es_pages_res/es_pages, (double) (es_pages - es_pages_res)*es_page/(1024.0*1024*1024),
+            es_ns_pref/1e6, es_ns_mmid/1e6, es_bytes_io/(1024.0*1024*1024), es_ns_io/1e6);
+    }
+}
+
+// split the pages of the routed slices of every MUL_MAT_ID sharing these ids across all threads
+static void es_prefault(const struct ggml_cgraph * g, int node_n, int ith, int nth) {
+    const struct ggml_tensor * ids = g->nodes[node_n]->src[2];
+    size_t total = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        size_t k = 0;
+        const size_t lo = total*ith/nth, hi = total*(ith + 1)/nth;
+        volatile char sink = 0;
+        for (int j = node_n; j < g->n_nodes && j < node_n + 64; j++) {
+            const struct ggml_tensor * t = g->nodes[j];
+            if (t->op != GGML_OP_MUL_MAT_ID || t->src[2] != ids || !t->src[0]->data) {
+                continue;
+            }
+            const struct ggml_tensor * w = t->src[0];
+            for (int64_t r = 0; r < ids->ne[1]; r++) {
+                for (int64_t c = 0; c < ids->ne[0]; c++) {
+                    const int32_t e = es_id(ids, r, c);
+                    if (e < 0 || e >= w->ne[2]) {
+                        continue;
+                    }
+                    const char * base = (const char *) w->data + (size_t) e*w->nb[2];
+                    const size_t np = (w->nb[2] + es_page - 1)/es_page;
+                    if (pass == 0) {
+                        total += np;
+                        continue;
+                    }
+                    for (size_t i = 0; i < np; i++, k++) {
+                        if (k >= lo && k < hi) {
+                            sink += base[i*es_page < w->nb[2] ? i*es_page : w->nb[2] - 1];
+                        }
+                    }
+                }
+            }
+        }
+        (void) sink;
+    }
+}
+#endif
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -3138,6 +3413,36 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+#if !defined(_WIN32)
+        pthread_once(&es_once, es_init);
+        const bool es_node = (es_stats_on || es_pref_on || es_pread_n > 0 || es_willneed_on) && es_decode_mmid(node);
+        uint64_t es_t0 = 0;
+        if (es_node) {
+            if (state->ith == 0) {
+                es_t0 = es_now();
+                if (es_stats_on) {
+                    es_stats(node);
+                }
+            }
+            if ((es_pread_n > 0 || es_willneed_on) && es_first_for_ids(cgraph, node_n)) {
+                ggml_barrier(state->threadpool);
+                if (state->ith == 0) {
+                    es_io(cgraph, node_n);
+                }
+                ggml_barrier(state->threadpool);
+            } else if (es_pref_on && es_first_for_ids(cgraph, node_n)) {
+                ggml_barrier(state->threadpool);
+                es_prefault(cgraph, node_n, state->ith, params.nth);
+                ggml_barrier(state->threadpool);
+                if (state->ith == 0) {
+                    es_ns_pref += es_now() - es_t0;
+                }
+            } else {
+                ggml_barrier(state->threadpool);
+            }
+        }
+#endif
+
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
@@ -3156,6 +3461,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
         }
+#if !defined(_WIN32)
+        if (es_node && state->ith == 0) {
+            es_ns_mmid += es_now() - es_t0;
+        }
+#endif
     }
 
 #ifdef GGML_USE_OPENMP

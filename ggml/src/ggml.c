@@ -8175,3 +8175,27 @@ bool ggml_threadpool_params_match(const struct ggml_threadpool_params * p0, cons
     if (p0->strict_cpu != p1->strict_cpu ) return false;
     return memcmp(p0->cpumask, p1->cpumask, GGML_MAX_N_THREADS) == 0;
 }
+
+#define GGML_MMAP_REG_MAX 64
+static struct { const char * addr; size_t size; int fd; } g_mmap_reg[GGML_MMAP_REG_MAX];
+static int g_mmap_reg_n;
+
+void ggml_mmap_register(const void * addr, size_t size, int fd) {
+    if (g_mmap_reg_n < GGML_MMAP_REG_MAX) {
+        g_mmap_reg[g_mmap_reg_n].addr = (const char *) addr;
+        g_mmap_reg[g_mmap_reg_n].size = size;
+        g_mmap_reg[g_mmap_reg_n].fd   = fd;
+        g_mmap_reg_n++;
+    }
+}
+
+int ggml_mmap_lookup(const void * p, size_t * off) {
+    const char * c = (const char *) p;
+    for (int i = 0; i < g_mmap_reg_n; i++) {
+        if (c >= g_mmap_reg[i].addr && c < g_mmap_reg[i].addr + g_mmap_reg[i].size) {
+            *off = (size_t) (c - g_mmap_reg[i].addr);
+            return g_mmap_reg[i].fd;
+        }
+    }
+    return -1;
+}

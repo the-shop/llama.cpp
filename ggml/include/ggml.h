@@ -355,6 +355,10 @@ extern "C" {
     GGML_NORETURN GGML_ATTRIBUTE_FORMAT(3, 4)
     GGML_API void ggml_abort(const char * file, int line, const char * fmt, ...);
 
+    // registry of mmap'd model files, used by experimental expert I/O in the CPU backend
+    GGML_API void ggml_mmap_register(const void * addr, size_t size, int fd);
+    GGML_API int  ggml_mmap_lookup(const void * p, size_t * off);
+
     enum ggml_status {
         GGML_STATUS_ALLOC_FAILED = -2,
         GGML_STATUS_FAILED = -1,

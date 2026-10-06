@@ -496,6 +496,9 @@ struct llama_mmap::impl {
         if (addr == MAP_FAILED) {
             throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
         }
+        if (getenv("GGML_EXPERT_PREAD")) {
+            ggml_mmap_register(addr, file->size(), dup(fd));
+        }
 
         // page-aligned madvise over [beg, end), clamped to the file
         auto advise = [&](size_t beg, size_t end, int advice, const char * name) {
