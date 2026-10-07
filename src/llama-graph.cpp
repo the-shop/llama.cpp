@@ -2210,7 +2210,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * ids_mm = selected_experts;
     if (expert_pool && expert_pool->has_layer(il)) {
         GGML_ASSERT(!gate_up_exps && !up_exps_b && !gate_exps_b && !down_exps_b && !weight_before_ffn);
-        ids_mm = expert_pool->build_ids(ctx0, selected_experts, il);
+        ids_mm = expert_pool->build_ids(ctx0, selected_experts, cur, il);
         ggml_format_name(ids_mm, "ffn_moe_pool_ids-%d", il);
         up_exps   = expert_pool->view(ctx0, llama_expert_pool::UP,   n_tokens, il);
         gate_exps = expert_pool->view(ctx0, llama_expert_pool::GATE, n_tokens, il);

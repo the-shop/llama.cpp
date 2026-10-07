@@ -33,6 +33,9 @@ llama_expert_pool::llama_expert_pool(double gib, int n_threads, int n_layer, int
     const char * rows = getenv("LLAMA_EXPERT_POOL_PREFILL_ROWS");
     prefill_rows = rows ? std::max(32, atoi(rows)) : 256;
     n_win = 1 + prefill_depth;
+    const char * pf = getenv("LLAMA_EXPERT_POOL_DECODE_PREFETCH");
+    decode_prefetch = pf ? std::min(16, std::max(0, atoi(pf))) : 0;
+    gate_inp.assign(n_layer, nullptr);
 }
 
 llama_expert_pool::~llama_expert_pool() {
@@ -46,6 +49,9 @@ llama_expert_pool::~llama_expert_pool() {
         if (pw.layer >= 0) {
             io->wait(pw.g);
         }
+    }
+    for (auto & it : pf_pending) {
+        io->wait(it.second->g);
     }
     io.reset();
     for (int p = 0; p < N_PROJ; ++p) {
@@ -231,11 +237,18 @@ static void llama_expert_pool_op(ggml_tensor * dst, int ith, int nth, void * use
     c->pool->run(dst->src[0], dst, c->il);
 }
 
-ggml_tensor * llama_expert_pool::build_ids(ggml_context * ctx0, ggml_tensor * selected_experts, int il) {
+ggml_tensor * llama_expert_pool::build_ids(ggml_context * ctx0, ggml_tensor * selected_experts, ggml_tensor * cur, int il) {
     GGML_ASSERT(selected_experts->type == GGML_TYPE_I32);
-    ggml_tensor * args[1] = { selected_experts };
+    ggml_tensor * args[2] = { selected_experts, nullptr };
+    int n_args = 1;
+    // decode: guess the next layer's experts from its router applied to this layer's MoE input
+    if (decode_prefetch > 0 && !window_mode(selected_experts->ne[1]) && il + 1 < n_layer && gate_inp[il + 1]) {
+        ggml_tensor * logits = ggml_mul_mat(ctx0, gate_inp[il + 1], cur);
+        args[1] = ggml_argsort_top_k(ctx0, logits, decode_prefetch);
+        n_args = 2;
+    }
     ggml_tensor * ids = ggml_custom_4d(ctx0, GGML_TYPE_I32, selected_experts->ne[0], selected_experts->ne[1], 1, 1,
-            args, 1, llama_expert_pool_op, 1, &calls[il]);
+            args, n_args, llama_expert_pool_op, 1, &calls[il]);
     return ids;
 }
 
@@ -273,9 +286,14 @@ void llama_expert_pool::run(const ggml_tensor * ids, ggml_tensor * dst, int il) 
 
     std::vector<int32_t> slot_of_expert;
     if (window_mode(n_tokens)) {
+        resolve_prefetch();
         load_window(il, experts, n_tokens);
     } else {
+        resolve_prefetch();
         load_lru(il, experts, slot_of_expert);
+        if (dst->src[1]) {
+            prefetch(il + 1, dst->src[1]);
+        }
     }
 
     int32_t * out = (int32_t *) dst->data;
@@ -318,9 +336,11 @@ void llama_expert_pool::load_lru(int il, const std::vector<int32_t> & experts, s
         } else {
             slot = head;
             const int64_t old = key_of[slot];
-            GGML_ASSERT(stamp[old] != cur_stamp && "expert pool: one call needs more experts than the LRU holds");
+            if (old >= 0) {
+                GGML_ASSERT(stamp[old] != cur_stamp && "expert pool: one call needs more experts than the LRU holds");
+                slot_of[old] = -1;
+            }
             lru_unlink(slot);
-            slot_of[old] = -1;
         }
         key_of[slot] = key;
         slot_of[key] = slot;
@@ -424,6 +444,79 @@ void llama_expert_pool::lru_unlink(int slot) {
     prev[slot] = next[slot] = -1;
 }
 
+// a guessed expert is read behind the demand reads into the LRU, never evicting an expert of the current call
+void llama_expert_pool::prefetch(int il, const ggml_tensor * pred) {
+    for (int64_t t = 0; t < pred->ne[1]; ++t) {
+        const int32_t * row = (const int32_t *) ((const char *) pred->data + t*pred->nb[1]);
+        for (int64_t j = 0; j < pred->ne[0]; ++j) {
+            const int32_t e = row[j];
+            GGML_ASSERT(e >= 0 && e < n_expert);
+            const int64_t key = (int64_t) il*n_expert + e;
+            if (slot_of[key] >= 0) {
+                continue;
+            }
+            int32_t slot;
+            if (n_free_next < n_slots) {
+                slot = (int32_t) n_free_next++;
+            } else {
+                slot = head;
+                const int64_t old = key_of[slot];
+                if (old >= 0) {
+                    if (stamp[old] == cur_stamp) {
+                        return;
+                    }
+                    slot_of[old] = -1;
+                }
+                lru_unlink(slot);
+            }
+            key_of[slot] = key;
+            slot_of[key] = slot;
+            lru_push_back(slot);
+            auto pf = std::make_unique<pf_entry>();
+            pf->slot = slot;
+            queue_load(il, e, slot, pf->jobs);
+            io->submit(pf->jobs, pf->g, false);
+            pf_pending.emplace(key, std::move(pf));
+            ++n_pf_issued;
+        }
+    }
+}
+
+// before a call: wait for guesses it routed to, drop the rest unless their reads already ran
+void llama_expert_pool::resolve_prefetch() {
+    for (auto & it : pf_pending) {
+        const int64_t key = it.first;
+        pf_entry & pf = *it.second;
+        bool complete = true;
+        if (stamp[key] == cur_stamp) {
+            ++n_pf_used;
+        } else {
+            for (auto & j : pf.jobs) {
+                if (io->cancel(j)) {
+                    complete = false;
+                }
+            }
+        }
+        io->wait(pf.g);
+        if (complete) {
+            if (stamp[key] != cur_stamp) {
+                ++n_pf_unused;
+            }
+            continue;
+        }
+        ++n_pf_cancelled;
+        // the slot holds partial data: free it, least recent so it is reused first
+        slot_of[key] = -1;
+        key_of[pf.slot] = -1;
+        lru_unlink(pf.slot);
+        prev[pf.slot] = -1;
+        next[pf.slot] = head;
+        if (head >= 0) prev[head] = pf.slot; else tail = pf.slot;
+        head = pf.slot;
+    }
+    pf_pending.clear();
+}
+
 void llama_expert_pool::lru_push_back(int slot) {
     prev[slot] = tail;
     next[slot] = -1;
@@ -440,6 +533,10 @@ void llama_expert_pool::log_stats(const char * why) {
             " window hit %" PRIu64 " copy %" PRIu64 " read %" PRIu64 " | read %.2f GiB in %.2f s (%.2f GB/s) | op %.2f s\n",
             why, n_calls_lru, n, n ? 100.0*n_hit/n : 0.0, n_calls_window, n_win_hit, n_win_copy, n_win_read,
             io->bytes_read/(1024.0*1024.0*1024.0), t_read, t_read > 0 ? io->bytes_read/1e9/t_read : 0.0, t_total);
+    if (decode_prefetch > 0) {
+        LLAMA_LOG_WARN("expert_pool %s: decode prefetch issued %" PRIu64 " used %" PRIu64 " (%.1f%%) unused %" PRIu64 " cancelled %" PRIu64 "\n",
+                why, n_pf_issued, n_pf_used, n_pf_issued ? 100.0*n_pf_used/n_pf_issued : 0.0, n_pf_unused, n_pf_cancelled);
+    }
 }
 
 void llama_expert_pool::trace_write(const ggml_tensor * ids, int il, bool prefill) {

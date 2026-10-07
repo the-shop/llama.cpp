@@ -121,7 +121,10 @@ struct llama_expert_pool {
     bool has_layer(int il) const { return initialized && il >= 0 && il < n_layer; }
 
     // slot ids for MUL_MAT_ID over view(); runs the loads on the CPU when the graph reaches it
-    ggml_tensor * build_ids(ggml_context * ctx, ggml_tensor * selected_experts, int il);
+    // cur: the MoE input, for the next layer's guess (LLAMA_EXPERT_POOL_DECODE_PREFETCH)
+    ggml_tensor * build_ids(ggml_context * ctx, ggml_tensor * selected_experts, ggml_tensor * cur, int il);
+
+    void set_gate(int il, ggml_tensor * gate) { if (il >= 0 && il < n_layer) gate_inp[il] = gate; }
 
     // the pool tensor of `p` as the mul_mat_id weights for a call with n_tokens rows
     ggml_tensor * view(ggml_context * ctx, proj p, int64_t n_tokens, int il) const;
@@ -154,6 +157,8 @@ private:
     void wait_window(int w);
     void queue_load(int il, int expert, int slot, std::vector<llama_io_pool::job> & out);
     void run_jobs();
+    void prefetch(int il, const ggml_tensor * pred);
+    void resolve_prefetch();
     void lru_unlink(int slot);
     void lru_push_back(int slot);
     void log_stats(const char * why);
@@ -196,6 +201,18 @@ private:
     std::vector<pending> pend; // per window: reads in flight
     std::vector<uint32_t> stamp;       // per key: last call that touched it (dedup within a call)
     uint32_t cur_stamp = 0;
+
+    // LLAMA_EXPERT_POOL_DECODE_PREFETCH=k: per decode row, read the k experts the next layer's router picks for this
+    // layer's MoE input, behind the demand reads; they only change what is resident, never what is computed
+    int decode_prefetch = 0;
+    std::vector<ggml_tensor *> gate_inp;
+    struct pf_entry {
+        int32_t slot = -1;
+        llama_io_pool::group g;
+        std::vector<llama_io_pool::job> jobs;
+    };
+    std::unordered_map<int64_t, std::unique_ptr<pf_entry>> pf_pending;
+    uint64_t n_pf_issued = 0, n_pf_used = 0, n_pf_unused = 0, n_pf_cancelled = 0;
 
     std::unique_ptr<llama_io_pool> io;
     std::vector<llama_io_pool::job> jobs; // demand reads of the current call

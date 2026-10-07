@@ -283,6 +283,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             expert_pool->add_source(ml, il, llama_expert_pool::GATE, tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", il).str());
             expert_pool->add_source(ml, il, llama_expert_pool::UP,   tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", il).str());
             expert_pool->add_source(ml, il, llama_expert_pool::DOWN, tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il).str());
+            expert_pool->set_gate(il, layer.ffn_gate_inp);
             create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, TENSOR_NOT_REQUIRED | TENSOR_SKIP);
             create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, TENSOR_SKIP);
         } else {
