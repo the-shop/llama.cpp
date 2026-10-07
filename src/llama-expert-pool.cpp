@@ -28,6 +28,11 @@ llama_expert_pool::llama_expert_pool(double gib, int n_threads, int n_layer, int
     : gib(gib), n_threads(n_threads), n_layer(n_layer), n_expert(n_expert), layers(n_layer) {
     const char * every = getenv("LLAMA_EXPERT_POOL_LOG_EVERY");
     log_every = every ? strtoull(every, nullptr, 10) : 4800;
+    const char * depth = getenv("LLAMA_EXPERT_POOL_PREFILL_STREAM");
+    prefill_depth = depth ? std::max(0, atoi(depth)) : 0;
+    const char * rows = getenv("LLAMA_EXPERT_POOL_PREFILL_ROWS");
+    prefill_rows = rows ? std::max(32, atoi(rows)) : 256;
+    n_win = 1 + prefill_depth;
 }
 
 llama_expert_pool::~llama_expert_pool() {
@@ -37,14 +42,12 @@ llama_expert_pool::~llama_expert_pool() {
     if (trace) {
         fclose(trace);
     }
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-        stop = true;
+    for (auto & pw : pend) {
+        if (pw.layer >= 0) {
+            io->wait(pw.g);
+        }
     }
-    cv_work.notify_all();
-    for (auto & t : threads) {
-        t.join();
-    }
+    io.reset();
     for (int p = 0; p < N_PROJ; ++p) {
         if (buf[p]) {
             ggml_backend_buffer_free(buf[p]);
@@ -136,8 +139,8 @@ void llama_expert_pool::init(bool dry) {
     }
     n_slots = (int64_t) (gib * 1024.0 * 1024.0 * 1024.0 / slot_bytes);
 
-    // the window holds one layer, the LRU at least a decode call's experts (fewer than 32 rows x top-k)
-    const int64_t n_min = 2*(int64_t) n_expert;
+    // the windows hold one layer each, the LRU at least a decode call's experts (fewer than 32 rows x top-k)
+    const int64_t n_min = (n_win + 1)*(int64_t) n_expert;
     if (n_slots < n_min) {
         throw std::runtime_error(format("expert pool: %.1f GiB gives %" PRId64 " slots, need at least %" PRId64 " (%.1f GiB)",
                     gib, n_slots, n_min, (double) n_min*slot_bytes/(1024.0*1024.0*1024.0)));
@@ -193,12 +196,10 @@ void llama_expert_pool::init(bool dry) {
     key_of.assign(n_slots, -1);
     prev.assign(n_slots, -1);
     next.assign(n_slots, -1);
-    window_layer.assign(n_expert, -1);
-    n_free_next = n_expert;
-
-    for (int i = 1; i < n_threads; ++i) {
-        threads.emplace_back([this] { worker(); });
-    }
+    window_layer.assign((size_t) n_win*n_expert, -1);
+    pend = std::vector<pending>(n_win);
+    n_free_next = (int64_t) n_win*n_expert;
+    io = std::make_unique<llama_io_pool>(n_threads);
 
     if (const char * path = getenv("LLAMA_EXPERT_TRACE")) {
         trace = fopen(path, "wb");
@@ -213,9 +214,12 @@ void llama_expert_pool::init(bool dry) {
         LLAMA_LOG_WARN("%s: tracing the routing to %s\n", __func__, path);
     }
 
-    LLAMA_LOG_WARN("%s: %.2f GiB on %s: %" PRId64 " slots of %.2f MiB (window %d + LRU %" PRId64 "), %d reader threads, %zu files with F_NOCACHE\n",
+    LLAMA_LOG_WARN("%s: %.2f GiB on %s: %" PRId64 " slots of %.2f MiB (%d windows of %d + LRU %" PRId64 "), %d reader threads, %zu files with F_NOCACHE\n",
             __func__, (double) n_slots*slot_bytes/(1024.0*1024.0*1024.0), ggml_backend_dev_name(dev), n_slots, slot_bytes/(1024.0*1024.0),
-            n_expert, n_slots - n_expert, n_threads, fds.size());
+            n_win, n_expert, n_slots - (int64_t) n_win*n_expert, n_threads, fds.size());
+    if (prefill_depth > 0) {
+        LLAMA_LOG_WARN("%s: prefill calls of >= %d rows read whole layers, %d layers ahead\n", __func__, prefill_rows, prefill_depth);
+    }
 }
 
 static void llama_expert_pool_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
@@ -235,10 +239,10 @@ ggml_tensor * llama_expert_pool::build_ids(ggml_context * ctx0, ggml_tensor * se
     return ids;
 }
 
-ggml_tensor * llama_expert_pool::view(ggml_context * ctx0, proj p, int64_t n_tokens) const {
+ggml_tensor * llama_expert_pool::view(ggml_context * ctx0, proj p, int64_t n_tokens, int il) const {
     ggml_tensor * t = pool[p];
     if (window_mode(n_tokens)) {
-        return ggml_view_3d(ctx0, t, t->ne[0], t->ne[1], n_expert, t->nb[1], t->nb[2], 0);
+        return ggml_view_3d(ctx0, t, t->ne[0], t->ne[1], n_expert, t->nb[1], t->nb[2], (size_t) (il % n_win)*n_expert*t->nb[2]);
     }
     return t;
 }
@@ -269,7 +273,7 @@ void llama_expert_pool::run(const ggml_tensor * ids, ggml_tensor * dst, int il) 
 
     std::vector<int32_t> slot_of_expert;
     if (window_mode(n_tokens)) {
-        load_window(il, experts);
+        load_window(il, experts, n_tokens);
     } else {
         load_lru(il, experts, slot_of_expert);
     }
@@ -320,110 +324,97 @@ void llama_expert_pool::load_lru(int il, const std::vector<int32_t> & experts, s
         }
         key_of[slot] = key;
         slot_of[key] = slot;
-        queue_load(il, e, slot);
+        queue_load(il, e, slot, jobs);
         lru_push_back(slot);
         slot_of_expert[e] = slot;
     }
-    run_tasks();
+    run_jobs();
 }
 
-void llama_expert_pool::load_window(int il, const std::vector<int32_t> & experts) {
-    for (int32_t e : experts) {
-        if (window_layer[e] == il) {
-            ++n_win_hit;
-            continue;
-        }
-        const int32_t slot = slot_of[(int64_t) il*n_expert + e];
-        if (slot >= 0) {
-            ++n_win_copy;
-            queue_copy(slot, e);
-        } else {
-            ++n_win_read;
-            queue_load(il, e, e);
-        }
-        window_layer[e] = il;
-    }
-    run_tasks();
-}
-
-void llama_expert_pool::queue_load(int il, int expert, int slot) {
-    for (int p = 0; p < N_PROJ; ++p) {
-        const source & s = layers[il].src[p];
-        tasks.push_back({ (uint8_t *) mem[p] + (size_t) slot*s.stride, nullptr, s.fd, s.offset + (size_t) expert*s.stride, s.stride });
-    }
-}
-
-void llama_expert_pool::queue_copy(int from_slot, int to_slot) {
-    for (int p = 0; p < N_PROJ; ++p) {
-        const size_t n = layers[0].src[p].stride;
-        tasks.push_back({ (uint8_t *) mem[p] + (size_t) to_slot*n, (const uint8_t *) mem[p] + (size_t) from_slot*n, -1, 0, n });
-    }
-}
-
-static void llama_expert_pool_do(const llama_expert_pool::task & t) {
-    if (t.src) {
-        memcpy(t.dst, t.src, t.n);
+void llama_expert_pool::window_job(int il, int w, int e, std::vector<llama_io_pool::job> & out) {
+    const size_t idx = (size_t) w*n_expert + e;
+    if (window_layer[idx] == il) {
+        ++n_win_hit;
         return;
     }
-    size_t done = 0;
-    while (done < t.n) {
-        const ssize_t got = pread(t.fd, t.dst + done, t.n - done, (off_t) (t.offset + done));
-        if (got < 0 && errno == EINTR) {
-            continue;
+    const int32_t slot = slot_of[(int64_t) il*n_expert + e];
+    const int32_t dst  = (int32_t) idx;
+    if (slot >= 0) {
+        ++n_win_copy;
+        for (int p = 0; p < N_PROJ; ++p) {
+            const size_t n = layers[0].src[p].stride;
+            out.push_back({ (uint8_t *) mem[p] + (size_t) dst*n, (const uint8_t *) mem[p] + (size_t) slot*n, -1, 0, n });
         }
-        if (got <= 0) {
-            GGML_ABORT("expert pool: pread failed: %s", got < 0 ? strerror(errno) : "end of file");
-        }
-        done += (size_t) got;
+    } else {
+        ++n_win_read;
+        queue_load(il, e, dst, out);
+    }
+    // a pending window is waited for before any use, so it can be marked now
+    window_layer[idx] = il;
+}
+
+void llama_expert_pool::wait_window(int w) {
+    if (pend[w].layer >= 0) {
+        const int64_t t0 = ggml_time_us();
+        io->wait(pend[w].g);
+        t_read += (ggml_time_us() - t0) / 1e6;
+        pend[w].jobs.clear();
+        pend[w].layer = -1;
     }
 }
 
-void llama_expert_pool::run_tasks() {
-    if (tasks.empty()) {
-        return;
-    }
-    const int64_t t0 = ggml_time_us();
-    for (const auto & t : tasks) {
-        if (!t.src) {
-            bytes_read += t.n;
-        }
-    }
-    std::unique_lock<std::mutex> lock(mtx);
-    next_task = 0;
-    n_done = 0;
-    ++generation;
-    cv_work.notify_all();
-    while (next_task < tasks.size()) {
-        const task t = tasks[next_task++];
-        lock.unlock();
-        llama_expert_pool_do(t);
-        lock.lock();
-        ++n_done;
-    }
-    cv_done.wait(lock, [this] { return n_done == tasks.size(); });
-    tasks.clear();
-    t_read += (ggml_time_us() - t0) / 1e6;
-}
+void llama_expert_pool::load_window(int il, const std::vector<int32_t> & experts, int64_t n_tokens) {
+    const int w = il % n_win;
+    wait_window(w);
 
-void llama_expert_pool::worker() {
-    uint64_t seen = 0;
-    std::unique_lock<std::mutex> lock(mtx);
-    while (true) {
-        cv_work.wait(lock, [&] { return stop || generation != seen; });
-        if (stop) {
-            return;
+    // whole layers: every expert, routed or not, and the next layers' reads start behind this call
+    const bool whole = prefill_depth > 0 && n_tokens >= prefill_rows;
+    if (whole) {
+        for (int e = 0; e < n_expert; ++e) {
+            window_job(il, w, e, jobs);
         }
-        seen = generation;
-        while (next_task < tasks.size()) {
-            const task t = tasks[next_task++];
-            lock.unlock();
-            llama_expert_pool_do(t);
-            lock.lock();
-            if (++n_done == tasks.size()) {
-                cv_done.notify_one();
+    } else {
+        for (int32_t e : experts) {
+            window_job(il, w, e, jobs);
+        }
+    }
+    run_jobs();
+
+    if (whole) {
+        // the window of il + d last held layer il + d - n_win <= il - 1, whose matmuls the GPU has finished
+        for (int d = 1; d <= prefill_depth && il + d < n_layer; ++d) {
+            const int x  = il + d;
+            const int wx = x % n_win;
+            if (pend[wx].layer == x) {
+                continue;
+            }
+            wait_window(wx);
+            for (int e = 0; e < n_expert; ++e) {
+                window_job(x, wx, e, pend[wx].jobs);
+            }
+            if (!pend[wx].jobs.empty()) {
+                pend[wx].layer = x;
+                io->submit(pend[wx].jobs, pend[wx].g, false);
             }
         }
     }
+}
+
+void llama_expert_pool::queue_load(int il, int expert, int slot, std::vector<llama_io_pool::job> & out) {
+    for (int p = 0; p < N_PROJ; ++p) {
+        const source & s = layers[il].src[p];
+        out.push_back({ (uint8_t *) mem[p] + (size_t) slot*s.stride, nullptr, s.fd, s.offset + (size_t) expert*s.stride, s.stride });
+    }
+}
+
+void llama_expert_pool::run_jobs() {
+    if (jobs.empty()) {
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    io->run(jobs);
+    jobs.clear();
+    t_read += (ggml_time_us() - t0) / 1e6;
 }
 
 void llama_expert_pool::lru_unlink(int slot) {
@@ -448,7 +439,7 @@ void llama_expert_pool::log_stats(const char * why) {
     LLAMA_LOG_WARN("expert_pool %s: decode calls %" PRIu64 " experts %" PRIu64 " hit %.1f%% | prefill calls %" PRIu64
             " window hit %" PRIu64 " copy %" PRIu64 " read %" PRIu64 " | read %.2f GiB in %.2f s (%.2f GB/s) | op %.2f s\n",
             why, n_calls_lru, n, n ? 100.0*n_hit/n : 0.0, n_calls_window, n_win_hit, n_win_copy, n_win_read,
-            bytes_read/(1024.0*1024.0*1024.0), t_read, t_read > 0 ? bytes_read/1e9/t_read : 0.0, t_total);
+            io->bytes_read/(1024.0*1024.0*1024.0), t_read, t_read > 0 ? io->bytes_read/1e9/t_read : 0.0, t_total);
 }
 
 void llama_expert_pool::trace_write(const ggml_tensor * ids, int il, bool prefill) {

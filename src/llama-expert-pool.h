@@ -124,7 +124,7 @@ struct llama_expert_pool {
     ggml_tensor * build_ids(ggml_context * ctx, ggml_tensor * selected_experts, int il);
 
     // the pool tensor of `p` as the mul_mat_id weights for a call with n_tokens rows
-    ggml_tensor * view(ggml_context * ctx, proj p, int64_t n_tokens) const;
+    ggml_tensor * view(ggml_context * ctx, proj p, int64_t n_tokens, int il) const;
 
     static bool window_mode(int64_t n_tokens) { return n_tokens >= 32; }
 
@@ -145,23 +145,15 @@ struct llama_expert_pool {
         int il;
     };
 
-    struct task {
-        uint8_t     * dst;
-        const uint8_t * src; // memcpy from another slot when set
-        int           fd;
-        size_t        offset;
-        size_t        n;
-    };
-
     void run(const ggml_tensor * ids, ggml_tensor * dst, int il);
 
 private:
     void load_lru (int il, const std::vector<int32_t> & experts, std::vector<int32_t> & slot_of_expert);
-    void load_window(int il, const std::vector<int32_t> & experts);
-    void queue_load(int il, int expert, int slot);
-    void queue_copy(int from_slot, int to_slot);
-    void run_tasks();
-    void worker();
+    void load_window(int il, const std::vector<int32_t> & experts, int64_t n_tokens);
+    void window_job(int il, int w, int e, std::vector<llama_io_pool::job> & out);
+    void wait_window(int w);
+    void queue_load(int il, int expert, int slot, std::vector<llama_io_pool::job> & out);
+    void run_jobs();
     void lru_unlink(int slot);
     void lru_push_back(int slot);
     void log_stats(const char * why);
@@ -191,22 +183,25 @@ private:
     std::vector<int32_t> prev, next;
     int32_t head = -1, tail = -1; // head = least recently used
     int64_t n_free_next = 0;      // slots [n_free_next, n_slots) never used yet
-    std::vector<int32_t> window_layer; // window slot e holds expert e of this layer, -1 if none
+    // windows: slots [w*n_expert, (w+1)*n_expert) serve the prefill calls of layers il with il % n_win == w
+    int n_win = 1;
+    int prefill_depth = 0; // LLAMA_EXPERT_POOL_PREFILL_STREAM: whole-layer reads this many layers ahead
+    int prefill_rows = 256;
+    std::vector<int32_t> window_layer; // [w*n_expert + e]: the layer whose expert e window w holds, -1 if none
+    struct pending {
+        int layer = -1;
+        llama_io_pool::group g;
+        std::vector<llama_io_pool::job> jobs;
+    };
+    std::vector<pending> pend; // per window: reads in flight
     std::vector<uint32_t> stamp;       // per key: last call that touched it (dedup within a call)
     uint32_t cur_stamp = 0;
 
-    // reader threads
-    std::vector<std::thread> threads;
-    std::mutex mtx;
-    std::condition_variable cv_work, cv_done;
-    std::vector<task> tasks;
-    size_t next_task = 0, n_done = 0;
-    uint64_t generation = 0;
-    bool stop = false;
+    std::unique_ptr<llama_io_pool> io;
+    std::vector<llama_io_pool::job> jobs; // demand reads of the current call
 
     // stats
     uint64_t n_calls_lru = 0, n_calls_window = 0, n_hit = 0, n_miss = 0, n_win_hit = 0, n_win_copy = 0, n_win_read = 0;
-    uint64_t bytes_read = 0;
     double t_read = 0.0, t_total = 0.0;
     uint64_t log_every = 0;
 

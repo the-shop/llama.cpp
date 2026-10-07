@@ -2212,9 +2212,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         GGML_ASSERT(!gate_up_exps && !up_exps_b && !gate_exps_b && !down_exps_b && !weight_before_ffn);
         ids_mm = expert_pool->build_ids(ctx0, selected_experts, il);
         ggml_format_name(ids_mm, "ffn_moe_pool_ids-%d", il);
-        up_exps   = expert_pool->view(ctx0, llama_expert_pool::UP,   n_tokens);
-        gate_exps = expert_pool->view(ctx0, llama_expert_pool::GATE, n_tokens);
-        down_exps = expert_pool->view(ctx0, llama_expert_pool::DOWN, n_tokens);
+        up_exps   = expert_pool->view(ctx0, llama_expert_pool::UP,   n_tokens, il);
+        gate_exps = expert_pool->view(ctx0, llama_expert_pool::GATE, n_tokens, il);
+        down_exps = expert_pool->view(ctx0, llama_expert_pool::DOWN, n_tokens, il);
     }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
