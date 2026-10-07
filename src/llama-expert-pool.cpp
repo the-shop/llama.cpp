@@ -213,7 +213,6 @@ void llama_expert_pool::init(bool dry) {
             throw std::runtime_error(std::string("expert pool: cannot open trace file ") + path);
         }
         setvbuf(trace, nullptr, _IOFBF, 1 << 20);
-        trace_tok.assign(n_layer, 0);
         const uint32_t hdr[4] = { 1, (uint32_t) n_layer, (uint32_t) n_expert, 0 };
         fwrite("LXTR", 1, 4, trace);
         fwrite(hdr, sizeof(uint32_t), 3, trace); // top_k is written with the first call
@@ -545,9 +544,16 @@ void llama_expert_pool::trace_write(const ggml_tensor * ids, int il, bool prefil
         const uint32_t top_k = (uint32_t) k;
         fwrite(&top_k, sizeof(top_k), 1, trace);
     }
+    // layer 0 sees the whole ubatch; later layers may only see the rows that produce output (the last ones)
+    const int64_t n = ids->ne[1];
+    if (il == 0) {
+        ub_base += ub_n;
+        ub_n = n;
+    }
+    GGML_ASSERT(n <= ub_n);
     std::vector<uint8_t> rec(8 + 2*k);
-    for (int64_t t = 0; t < ids->ne[1]; ++t) {
-        const uint32_t tok = trace_tok[il]++;
+    for (int64_t t = 0; t < n; ++t) {
+        const uint32_t tok = (uint32_t) (ub_base + (ub_n - n) + t);
         const uint16_t layer = (uint16_t) il;
         memcpy(rec.data(), &tok, 4);
         memcpy(rec.data() + 4, &layer, 2);
