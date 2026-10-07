@@ -3,6 +3,8 @@
 #include "llama-impl.h"
 #include "llama-model-loader.h"
 
+#include <algorithm>
+
 #include <cerrno>
 #include <cinttypes>
 #include <cstdlib>
@@ -469,5 +471,232 @@ void llama_expert_pool::trace_write(const ggml_tensor * ids, int il, bool prefil
             memcpy(rec.data() + 8 + 2*j, &e, 2);
         }
         fwrite(rec.data(), 1, rec.size(), trace);
+    }
+}
+
+llama_io_pool::llama_io_pool(int n_threads) {
+    for (int i = 0; i < n_threads; ++i) {
+        threads.emplace_back([this] { worker(); });
+    }
+}
+
+llama_io_pool::~llama_io_pool() {
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        stop = true;
+    }
+    cv_work.notify_all();
+    for (auto & t : threads) {
+        t.join();
+    }
+}
+
+void llama_io_pool::submit(std::vector<job> & jobs, group & g, bool front) {
+    if (jobs.empty()) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        g.remaining += (int) jobs.size();
+        std::vector<job *> ptrs;
+        for (auto & j : jobs) {
+            j.g = &g;
+            j.state = 0;
+            ptrs.push_back(&j);
+        }
+        if (front) {
+            q.insert(q.begin(), ptrs.begin(), ptrs.end());
+        } else {
+            q.insert(q.end(), ptrs.begin(), ptrs.end());
+        }
+    }
+    cv_work.notify_all();
+}
+
+void llama_io_pool::wait(group & g) {
+    std::unique_lock<std::mutex> lock(mtx);
+    cv_done.wait(lock, [&] { return g.remaining == 0; });
+}
+
+bool llama_io_pool::cancel(job & j) {
+    std::lock_guard<std::mutex> lock(mtx);
+    if (j.state != 0) {
+        return false;
+    }
+    q.erase(std::find(q.begin(), q.end(), &j));
+    j.state = 3;
+    if (--j.g->remaining == 0) {
+        cv_done.notify_all();
+    }
+    return true;
+}
+
+void llama_io_pool::run(std::vector<job> & jobs) {
+    group g;
+    submit(jobs, g, true);
+    wait(g);
+}
+
+static void llama_io_do(const llama_io_pool::job & t) {
+    if (t.src) {
+        memcpy(t.dst, t.src, t.n);
+        return;
+    }
+    size_t done = 0;
+    while (done < t.n) {
+        const ssize_t got = pread(t.fd, t.dst + done, t.n - done, (off_t) (t.offset + done));
+        if (got < 0 && errno == EINTR) {
+            continue;
+        }
+        if (got <= 0) {
+            GGML_ABORT("expert pool: pread failed: %s", got < 0 ? strerror(errno) : "end of file");
+        }
+        done += (size_t) got;
+    }
+}
+
+void llama_io_pool::worker() {
+    std::unique_lock<std::mutex> lock(mtx);
+    while (true) {
+        cv_work.wait(lock, [&] { return stop || !q.empty(); });
+        if (stop) {
+            return;
+        }
+        job * j = q.front();
+        q.pop_front();
+        j->state = 1;
+        lock.unlock();
+        llama_io_do(*j);
+        if (!j->src) {
+            bytes_read += j->n;
+        }
+        lock.lock();
+        j->state = 2;
+        if (--j->g->remaining == 0) {
+            cv_done.notify_all();
+        }
+    }
+}
+
+int llama_open_nocache(const llama_model_loader & ml, const std::string & name, size_t & offset, std::string & path) {
+    const auto * w = ml.get_weight(name.c_str());
+    if (w == nullptr) {
+        throw std::runtime_error("missing tensor " + name);
+    }
+    char buf[MAXPATHLEN];
+    if (fcntl(ml.files[w->idx]->file_id(), F_GETPATH, buf) == -1) {
+        throw std::runtime_error("F_GETPATH failed: " + std::string(strerror(errno)));
+    }
+    path = buf;
+    offset = w->offs;
+    const int fd = open(buf, O_RDONLY);
+    if (fd < 0) {
+        throw std::runtime_error("cannot open " + path);
+    }
+    // F_NOCACHE is a property of the open file, so the loader's own fd keeps caching
+    fcntl(fd, F_NOCACHE, 1);
+    fcntl(fd, F_RDAHEAD, 0);
+    return fd;
+}
+
+std::shared_ptr<llama_row_store> llama_row_store::from_env(const llama_model_loader & ml, const std::string & name) {
+    const char * on = getenv("LLAMA_PLE_PREAD");
+    if (on == nullptr || atoi(on) == 0) {
+        return nullptr;
+    }
+    const auto * w = ml.get_weight(name.c_str());
+    if (w == nullptr) {
+        return nullptr;
+    }
+    const char * mib = getenv("LLAMA_PLE_CACHE_MIB");
+    const char * thr = getenv("LLAMA_PLE_THREADS");
+    size_t offset;
+    std::string path;
+    const int fd = llama_open_nocache(ml, name, offset, path);
+    const ggml_tensor * t = w->tensor;
+    GGML_ASSERT(ggml_n_dims(t) == 2);
+    return std::make_shared<llama_row_store>(fd, offset, t->type, t->ne[0], t->ne[1],
+            (size_t) (mib ? atof(mib) : 1024.0) * 1024 * 1024, thr ? std::max(1, atoi(thr)) : 8);
+}
+
+llama_row_store::llama_row_store(int fd, size_t offset, ggml_type type, int64_t ne0, int64_t n_rows, size_t cache_bytes, int n_threads)
+    : ne0(ne0), fd(fd), offset(offset), type(type), n_rows(n_rows), row_bytes(ggml_row_size(type, ne0)), io(n_threads) {
+    GGML_ASSERT(ggml_get_type_traits(type)->to_float != nullptr || type == GGML_TYPE_F32);
+    capacity = std::max<int64_t>(1, (int64_t) (cache_bytes / row_bytes));
+    data.resize((size_t) capacity * row_bytes);
+    row_of.assign(capacity, -1);
+    ref.assign(capacity, 0);
+    stamp.assign(capacity, 0);
+    LLAMA_LOG_WARN("%s: %" PRId64 " rows of %zu bytes (%.0f MiB), %d reader threads, F_NOCACHE\n",
+            __func__, capacity, row_bytes, capacity*row_bytes/(1024.0*1024.0), n_threads);
+}
+
+llama_row_store::~llama_row_store() {
+    const uint64_t n = n_hit + n_miss;
+    if (n > 0) {
+        LLAMA_LOG_WARN("ple_rows final: rows %" PRIu64 " hit %.1f%% | read %.2f MiB in %.2f s\n",
+                n, 100.0*n_hit/n, io.bytes_read/(1024.0*1024.0), t_read);
+    }
+    close(fd);
+}
+
+void llama_row_store::gather(const int32_t * rows, size_t n, float * out) {
+    ++cur;
+    std::vector<int32_t> slots(n);
+    std::vector<llama_io_pool::job> jobs;
+    for (size_t i = 0; i < n; ++i) {
+        const int32_t r = rows[i];
+        GGML_ASSERT(r >= 0 && r < n_rows);
+        auto it = slot_of.find(r);
+        if (it != slot_of.end()) {
+            const int32_t s = it->second;
+            if (stamp[s] != cur) {
+                ++n_hit;
+            }
+            ref[s] = 1;
+            stamp[s] = cur;
+            slots[i] = s;
+            continue;
+        }
+        ++n_miss;
+        // CLOCK: a used bit buys one more sweep; rows of this call are never taken
+        int64_t s;
+        for (int64_t steps = 0;; ++steps) {
+            GGML_ASSERT(steps <= 2*capacity && "PLE row cache is smaller than one batch's rows");
+            s = hand;
+            hand = (hand + 1) % capacity;
+            if (row_of[s] < 0) {
+                break;
+            }
+            if (stamp[s] == cur) {
+                continue;
+            }
+            if (ref[s]) {
+                ref[s] = 0;
+                continue;
+            }
+            slot_of.erase(row_of[s]);
+            break;
+        }
+        row_of[s] = r;
+        slot_of[r] = (int32_t) s;
+        ref[s] = 1;
+        stamp[s] = cur;
+        slots[i] = (int32_t) s;
+        jobs.push_back({ data.data() + (size_t) s*row_bytes, nullptr, fd, offset + (size_t) r*row_bytes, row_bytes });
+    }
+    if (!jobs.empty()) {
+        const int64_t t0 = ggml_time_us();
+        io.run(jobs);
+        t_read += (ggml_time_us() - t0) / 1e6;
+    }
+    const auto to_float = ggml_get_type_traits(type)->to_float;
+    for (size_t i = 0; i < n; ++i) {
+        const uint8_t * src = data.data() + (size_t) slots[i]*row_bytes;
+        if (type == GGML_TYPE_F32) {
+            memcpy(out + i*ne0, src, row_bytes);
+        } else {
+            to_float(src, out + i*ne0, ne0);
+        }
     }
 }

@@ -14,7 +14,10 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <atomic>
 #include <condition_variable>
+#include <deque>
+#include <unordered_map>
 #include <cstdio>
 #include <cstdint>
 #include <memory>
@@ -24,6 +27,81 @@
 #include <vector>
 
 struct llama_model_loader;
+
+// reader threads with a priority queue: demand reads go to the front, prefetch to the back, queued jobs can be cancelled
+struct llama_io_pool {
+    struct group {
+        int remaining = 0;
+    };
+
+    struct job {
+        uint8_t       * dst;
+        const uint8_t * src;    // memcpy from here when set, else pread
+        int             fd;
+        size_t          offset;
+        size_t          n;
+        group         * g     = nullptr;
+        int             state = 0; // 0 queued, 1 running, 2 done, 3 cancelled
+    };
+
+    explicit llama_io_pool(int n_threads);
+    ~llama_io_pool();
+
+    // the jobs must stay where they are until the group is done
+    void submit(std::vector<job> & jobs, group & g, bool front);
+    void wait(group & g);
+    bool cancel(job & j); // false once the job has started
+    void run(std::vector<job> & jobs); // demand: front of the queue, then wait
+
+    std::atomic<uint64_t> bytes_read{0};
+
+private:
+    void worker();
+
+    std::deque<job *> q;
+    std::mutex mtx;
+    std::condition_variable cv_work, cv_done;
+    std::vector<std::thread> threads;
+    bool stop = false;
+};
+
+// a read-only fd on the file of tensor `name` whose reads bypass the page cache; offset = the tensor's data in it
+int llama_open_nocache(const llama_model_loader & ml, const std::string & name, size_t & offset, std::string & path);
+
+// LLAMA_PLE_PREAD=1: rows of a lazy table (the PLE n-gram embeddings) are read with F_NOCACHE pread into a fixed
+// CLOCK row cache (LLAMA_PLE_CACHE_MIB, default 1024) instead of through the mmap; gather() dequantizes with the
+// type's to_float, the function the CPU get_rows uses, so the result is the same bytes
+struct llama_row_store {
+    static std::shared_ptr<llama_row_store> from_env(const llama_model_loader & ml, const std::string & name);
+
+    llama_row_store(int fd, size_t offset, ggml_type type, int64_t ne0, int64_t n_rows, size_t cache_bytes, int n_threads);
+    ~llama_row_store();
+
+    // out: n rows of ne0 floats
+    void gather(const int32_t * rows, size_t n, float * out);
+
+    const int64_t ne0;
+
+private:
+    int fd;
+    size_t offset;
+    ggml_type type;
+    int64_t n_rows;
+    size_t row_bytes;
+    int64_t capacity;
+
+    std::vector<uint8_t> data;
+    std::unordered_map<int32_t, int32_t> slot_of;
+    std::vector<int32_t> row_of;
+    std::vector<uint8_t> ref;
+    std::vector<uint32_t> stamp;
+    uint32_t cur = 0;
+    int64_t hand = 0;
+
+    llama_io_pool io;
+    uint64_t n_hit = 0, n_miss = 0;
+    double t_read = 0.0;
+};
 
 struct llama_expert_pool {
     enum proj { GATE = 0, UP = 1, DOWN = 2, N_PROJ = 3 };

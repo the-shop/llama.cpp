@@ -737,6 +737,9 @@ struct llama_model {
     // experimental SSD expert streaming, nullptr unless LLAMA_EXPERT_POOL_GIB is set
     std::shared_ptr<struct llama_expert_pool> expert_pool;
 
+    // experimental: PLE table rows read with pread into a row cache, nullptr unless LLAMA_PLE_PREAD is set
+    std::shared_ptr<struct llama_row_store> ple_rows;
+
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
 
