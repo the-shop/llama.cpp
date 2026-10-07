@@ -994,6 +994,9 @@ struct llm_graph_qkv {
 struct llm_graph_context {
     const llm_arch arch;
 
+    // set by graph builders whose model streams its experts (LLAMA_EXPERT_POOL_GIB)
+    struct llama_expert_pool * expert_pool = nullptr;
+
     const llama_hparams & hparams;
     const llama_cparams & cparams;
     const llama_ubatch  & ubatch;

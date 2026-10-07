@@ -734,6 +734,9 @@ struct llama_model {
     // list of devices used in this model
     std::vector<llama_device> devices;
 
+    // experimental SSD expert streaming, nullptr unless LLAMA_EXPERT_POOL_GIB is set
+    std::shared_ptr<struct llama_expert_pool> expert_pool;
+
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
 

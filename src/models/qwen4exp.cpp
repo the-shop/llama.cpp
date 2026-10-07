@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-expert-pool.h"
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
@@ -274,8 +275,17 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         }
 
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, flags);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
-        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
+        if (expert_pool && il < n_layer && !(flags & TENSOR_SKIP)) {
+            // streamed: the pool reads these from the files, they are never loaded
+            expert_pool->add_source(ml, il, llama_expert_pool::GATE, tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", il).str());
+            expert_pool->add_source(ml, il, llama_expert_pool::UP,   tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", il).str());
+            expert_pool->add_source(ml, il, llama_expert_pool::DOWN, tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il).str());
+            create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, TENSOR_NOT_REQUIRED | TENSOR_SKIP);
+            create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, TENSOR_SKIP);
+        } else {
+            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
+            create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
+        }
 
         layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, flags);
         layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, flags);
@@ -283,8 +293,14 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", il), { n_ff_shexp, n_embd }, flags);
     };
 
+    expert_pool = mtp_only ? nullptr : llama_expert_pool::from_env(n_layer, (int) n_expert);
+
     for (int il = 0; il < n_layer; ++il) {
         load_block(il, trunk_flags);
+    }
+
+    if (expert_pool) {
+        expert_pool->init(ml.no_alloc);
     }
 
     // the MTP block: one full-attention QSA layer fed by [enorm(e) ; hnorm(h)_s] -> eh_proj per hc stream
@@ -400,6 +416,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
 llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
     const int64_t hc = hparams.dsv4_hc_mult;
+
+    expert_pool = model.expert_pool.get();
 
     GGML_ASSERT(hparams.n_embd_head_v() == hparams.n_embd_head_k());
 

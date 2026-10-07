@@ -17,6 +17,7 @@ set(LLAMA_CORE_SOURCES
     llama-context.cpp
     llama-cparams.cpp
     llama-grammar.cpp
+    llama-expert-pool.cpp
     llama-graph.cpp
     llama-hparams.cpp
     llama-impl.cpp

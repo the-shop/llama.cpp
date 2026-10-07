@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "llama-expert-pool.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -2205,6 +2206,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
+    // experimental SSD expert streaming: the experts come from a GPU slot pool, filled on the CPU per call
+    ggml_tensor * ids_mm = selected_experts;
+    if (expert_pool && expert_pool->has_layer(il)) {
+        GGML_ASSERT(!gate_up_exps && !up_exps_b && !gate_exps_b && !down_exps_b && !weight_before_ffn);
+        ids_mm = expert_pool->build_ids(ctx0, selected_experts, il);
+        ggml_format_name(ids_mm, "ffn_moe_pool_ids-%d", il);
+        up_exps   = expert_pool->view(ctx0, llama_expert_pool::UP,   n_tokens);
+        gate_exps = expert_pool->view(ctx0, llama_expert_pool::GATE, n_tokens);
+        down_exps = expert_pool->view(ctx0, llama_expert_pool::DOWN, n_tokens);
+    }
+
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
     if (weight_before_ffn) {
@@ -2238,7 +2250,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(up_exps, cur, ids_mm, up_exps_s); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
@@ -2251,7 +2263,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(gate_exps, cur, ids_mm, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -2352,7 +2364,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    experts = build_lora_mm_id(down_exps, cur, ids_mm, down_exps_s); // [n_embd, n_expert_used, n_tokens]
     if (arch == LLM_ARCH_MISTRAL4) {
         // src1 can exceed F16 range
         ggml_prec_set_src(experts, GGML_PREC_F32, 1);
