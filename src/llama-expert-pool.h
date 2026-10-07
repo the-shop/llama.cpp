@@ -6,11 +6,16 @@
 //   decode (n_tokens < 32): LRU over (layer, expert) in slots [n_expert, n_slots), ids remapped to slots
 //   prefill (n_tokens >= 32): slots [0, n_expert) hold one layer's experts, expert e in slot e (the Metal mm_id
 //   kernel takes at most 1024 experts), ids unchanged
+// LLAMA_EXPERT_TRACE=<path> (needs the pool) writes the routing of every call:
+//   header  "LXTR" u32 version=1, u32 n_layer, u32 n_expert, u32 top_k
+//   record  u32 token (rows of this layer seen so far, so equal across layers), u16 layer, u8 top_k,
+//           u8 flags (bit 0: prefill call, n_tokens >= 32), then top_k x u16 expert ids in router order
 
 #include "ggml.h"
 #include "ggml-backend.h"
 
 #include <condition_variable>
+#include <cstdio>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -126,4 +131,9 @@ private:
     uint64_t bytes_read = 0;
     double t_read = 0.0, t_total = 0.0;
     uint64_t log_every = 0;
+
+    // LLAMA_EXPERT_TRACE=<path>: the routing of every call, see trace_write()
+    FILE * trace = nullptr;
+    std::vector<uint32_t> trace_tok; // per layer: rows seen so far
+    void trace_write(const ggml_tensor * ids, int il, bool prefill);
 };

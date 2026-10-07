@@ -32,6 +32,9 @@ llama_expert_pool::~llama_expert_pool() {
     if (n_calls_lru + n_calls_window > 0) {
         log_stats("final");
     }
+    if (trace) {
+        fclose(trace);
+    }
     {
         std::lock_guard<std::mutex> lock(mtx);
         stop = true;
@@ -195,6 +198,19 @@ void llama_expert_pool::init(bool dry) {
         threads.emplace_back([this] { worker(); });
     }
 
+    if (const char * path = getenv("LLAMA_EXPERT_TRACE")) {
+        trace = fopen(path, "wb");
+        if (!trace) {
+            throw std::runtime_error(std::string("expert pool: cannot open trace file ") + path);
+        }
+        setvbuf(trace, nullptr, _IOFBF, 1 << 20);
+        trace_tok.assign(n_layer, 0);
+        const uint32_t hdr[4] = { 1, (uint32_t) n_layer, (uint32_t) n_expert, 0 };
+        fwrite("LXTR", 1, 4, trace);
+        fwrite(hdr, sizeof(uint32_t), 3, trace); // top_k is written with the first call
+        LLAMA_LOG_WARN("%s: tracing the routing to %s\n", __func__, path);
+    }
+
     LLAMA_LOG_WARN("%s: %.2f GiB on %s: %" PRId64 " slots of %.2f MiB (window %d + LRU %" PRId64 "), %d reader threads, %zu files with F_NOCACHE\n",
             __func__, (double) n_slots*slot_bytes/(1024.0*1024.0*1024.0), ggml_backend_dev_name(dev), n_slots, slot_bytes/(1024.0*1024.0),
             n_expert, n_slots - n_expert, n_threads, fds.size());
@@ -243,6 +259,10 @@ void llama_expert_pool::run(const ggml_tensor * ids, ggml_tensor * dst, int il) 
                 experts.push_back(e);
             }
         }
+    }
+
+    if (trace) {
+        trace_write(ids, il, window_mode(n_tokens));
     }
 
     std::vector<int32_t> slot_of_expert;
@@ -419,9 +439,35 @@ void llama_expert_pool::lru_push_back(int slot) {
 }
 
 void llama_expert_pool::log_stats(const char * why) {
+    if (trace) {
+        fflush(trace);
+    }
     const uint64_t n = n_hit + n_miss;
     LLAMA_LOG_WARN("expert_pool %s: decode calls %" PRIu64 " experts %" PRIu64 " hit %.1f%% | prefill calls %" PRIu64
             " window hit %" PRIu64 " copy %" PRIu64 " read %" PRIu64 " | read %.2f GiB in %.2f s (%.2f GB/s) | op %.2f s\n",
             why, n_calls_lru, n, n ? 100.0*n_hit/n : 0.0, n_calls_window, n_win_hit, n_win_copy, n_win_read,
             bytes_read/(1024.0*1024.0*1024.0), t_read, t_read > 0 ? bytes_read/1e9/t_read : 0.0, t_total);
+}
+
+void llama_expert_pool::trace_write(const ggml_tensor * ids, int il, bool prefill) {
+    const int64_t k = ids->ne[0];
+    if (ftell(trace) == 16) {
+        const uint32_t top_k = (uint32_t) k;
+        fwrite(&top_k, sizeof(top_k), 1, trace);
+    }
+    std::vector<uint8_t> rec(8 + 2*k);
+    for (int64_t t = 0; t < ids->ne[1]; ++t) {
+        const uint32_t tok = trace_tok[il]++;
+        const uint16_t layer = (uint16_t) il;
+        memcpy(rec.data(), &tok, 4);
+        memcpy(rec.data() + 4, &layer, 2);
+        rec[6] = (uint8_t) k;
+        rec[7] = prefill ? 1 : 0;
+        const int32_t * row = (const int32_t *) ((const char *) ids->data + t*ids->nb[1]);
+        for (int64_t j = 0; j < k; ++j) {
+            const uint16_t e = (uint16_t) row[j];
+            memcpy(rec.data() + 8 + 2*j, &e, 2);
+        }
+        fwrite(rec.data(), 1, rec.size(), trace);
+    }
 }
