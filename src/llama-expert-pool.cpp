@@ -280,7 +280,7 @@ void llama_expert_pool::run(const ggml_tensor * ids, ggml_tensor * dst, int il) 
     }
 
     if (trace) {
-        trace_write(ids, il, window_mode(n_tokens));
+        trace_write(ids, il);
     }
 
     std::vector<int32_t> slot_of_expert;
@@ -538,7 +538,7 @@ void llama_expert_pool::log_stats(const char * why) {
     }
 }
 
-void llama_expert_pool::trace_write(const ggml_tensor * ids, int il, bool prefill) {
+void llama_expert_pool::trace_write(const ggml_tensor * ids, int il) {
     const int64_t k = ids->ne[0];
     if (ftell(trace) == 16) {
         const uint32_t top_k = (uint32_t) k;
@@ -551,6 +551,8 @@ void llama_expert_pool::trace_write(const ggml_tensor * ids, int il, bool prefil
         ub_n = n;
     }
     GGML_ASSERT(n <= ub_n);
+    // prefill = the ubatch has more than one token, so a pruned layer of a prefill and a short prefill count too
+    const uint8_t flags = ub_n > 1 ? 1 : 0;
     std::vector<uint8_t> rec(8 + 2*k);
     for (int64_t t = 0; t < n; ++t) {
         const uint32_t tok = (uint32_t) (ub_base + (ub_n - n) + t);
@@ -558,7 +560,7 @@ void llama_expert_pool::trace_write(const ggml_tensor * ids, int il, bool prefil
         memcpy(rec.data(), &tok, 4);
         memcpy(rec.data() + 4, &layer, 2);
         rec[6] = (uint8_t) k;
-        rec[7] = prefill ? 1 : 0;
+        rec[7] = flags;
         const int32_t * row = (const int32_t *) ((const char *) ids->data + t*ids->nb[1]);
         for (int64_t j = 0; j < k; ++j) {
             const uint16_t e = (uint16_t) row[j];

@@ -10,7 +10,7 @@
 //   header  "LXTR" u32 version=1, u32 n_layer, u32 n_expert, u32 top_k
 //   record  u32 token (row index over all ubatches; a layer that only sees the output rows, e.g. the last
 //           layer of a server prefill, gets the indices of the ubatch's last rows), u16 layer, u8 top_k,
-//           u8 flags (bit 0: prefill call, n_tokens >= 32), then top_k x u16 expert ids in router order
+//           u8 flags (bit 0: prefill, the ubatch has more than one token), then top_k x u16 expert ids in router order
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -226,5 +226,5 @@ private:
     // LLAMA_EXPERT_TRACE=<path>: the routing of every call, see trace_write()
     FILE * trace = nullptr;
     int64_t ub_base = 0, ub_n = 0; // the current ubatch: first row index and row count, from layer 0
-    void trace_write(const ggml_tensor * ids, int il, bool prefill);
+    void trace_write(const ggml_tensor * ids, int il);
 };
